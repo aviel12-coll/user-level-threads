@@ -1,0 +1,14 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.out
+
+# Compiled test binaries (no extension)
+/test/*
+!/test/*.*
+
+# Windows / editor junk
+*Zone.Identifier
+Thumbs.db
+.DS_Store
