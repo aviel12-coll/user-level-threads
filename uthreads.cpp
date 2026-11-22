@@ -6,6 +6,7 @@
 #include <deque>
 #include <map>
 #include <set>
+#include <memory>
 #include <algorithm>
 #include <sys/time.h>
 #ifdef __x86_64__
@@ -36,34 +37,61 @@ enum ThreadState {
     BLOCKED
 };
 int quantum_usecs;
+
+/**
+ * A single user-level thread: its id, state, scheduling counters, saved context and stack.
+ *
+ * The stack is owned through std::unique_ptr, so it is released automatically when the
+ * Thread is destroyed (RAII). A Thread cannot be copied: two copies would share one stack
+ * and one saved context.
+ */
 class Thread {
 public:
-    int tid;
-    thread_entry_point entry_point;
-    char* stack;
-    ThreadState state;
-    int quantums;
-    sigjmp_buf env;
-    int quantums_until_wake_up;
-    bool is_blocked_by_user;
-    Thread(int tid, thread_entry_point entry_point) : tid(tid), entry_point(entry_point), state(READY), quantums(0), quantums_until_wake_up(0), is_blocked_by_user(false) {
-        if ( tid == 0) {
-            // main thread does not need a stack
-            stack = nullptr;
-        } else {
-            stack = new char[STACK_SIZE];
-        }
-    }
-    ~Thread() {
-        delete[] stack;
-    }
-    int save_context() {
-        std::cout << "save_context tid=" << tid  << std::endl;
-        return sigsetjmp(env, 0);
-    }
-    int load_context() {
-        siglongjmp(env, 1);
-    }
+    Thread(int tid, thread_entry_point entry_point)
+        : tid_(tid),
+          entry_point_(entry_point),
+          // The main thread (tid 0) runs on the process stack, so it gets no stack of its own.
+          stack_(tid == 0 ? nullptr : new char[STACK_SIZE]) {}
+
+    Thread(const Thread&) = delete;
+    Thread& operator=(const Thread&) = delete;
+
+    int tid() const { return tid_; }
+    thread_entry_point entry_point() const { return entry_point_; }
+
+    ThreadState state() const { return state_; }
+    void set_state(ThreadState state) { state_ = state; }
+
+    // Number of quantums this thread has started running.
+    int quantums() const { return quantums_; }
+    void start_quantum() { ++quantums_; }
+
+    // Sleeping: the thread sleeps for a number of quantums and wakes up when the count reaches 0.
+    void sleep_for(int num_quantums) { quantums_until_wake_up_ = num_quantums; }
+    // Counts one quantum of sleep. Returns true when the thread should wake up.
+    bool tick_sleep() { return --quantums_until_wake_up_ <= 0; }
+
+    // A thread can be both sleeping and blocked by the user; it becomes READY only when both end.
+    bool is_blocked_by_user() const { return blocked_by_user_; }
+    void set_blocked_by_user(bool blocked) { blocked_by_user_ = blocked; }
+
+    // Top of this thread's stack (the stack grows down from here).
+    char* stack_top() const { return stack_.get() + STACK_SIZE; }
+
+    // The saved execution context.
+    // sigsetjmp must be called directly by the scheduler, not from a helper method that returns:
+    // jumping back into the frame of a function that has already returned is undefined behaviour.
+    sigjmp_buf& env() { return env_; }
+
+private:
+    int tid_;
+    thread_entry_point entry_point_;
+    std::unique_ptr<char[]> stack_;
+    ThreadState state_ = READY;
+    int quantums_ = 0;
+    int quantums_until_wake_up_ = 0;
+    bool blocked_by_user_ = false;
+    sigjmp_buf env_;
 };
 
 
@@ -112,14 +140,14 @@ address_t translate_address(address_t addr) {
         delete pending_delete;
         pending_delete = nullptr;
     }
-    int ret_val = sigsetjmp(running_thread->env, 0);
+    int ret_val = sigsetjmp(running_thread->env(), 0);
     
     if (ret_val != 0) {
         unblock_signals();
         return;
     }
     // If the current thread is still RUNNING, move it to the READY state and add it to the end of the READY queue
-    running_thread->state = target;
+    running_thread->set_state(target);
 
     // If the current thread is still RUNNING, move it to the READY state and add it to the end of the READY queue
     if (target == READY) {
@@ -135,14 +163,14 @@ address_t translate_address(address_t addr) {
     running_thread = ready_threads.front();
     ready_threads.pop_front();
 
-    running_thread->state = RUNNING;
-    running_thread->quantums++;
+    running_thread->set_state(RUNNING);
+    running_thread->start_quantum();
     total_quantums++;
 
 
     reset_timer();
 
-    siglongjmp(running_thread->env, 1);
+    siglongjmp(running_thread->env(), 1);
 }
 
 
@@ -154,11 +182,10 @@ void timer_handler(int sig)
     // Decrease the quantums until wake up for all sleeping threads
     for (auto it = sleeping_threads.begin(); it != sleeping_threads.end();) {
         Thread* thread = it->second;
-        thread->quantums_until_wake_up--;
-        if (thread->quantums_until_wake_up <= 0) {
+        if (thread->tick_sleep()) {
 
-            if (thread->is_blocked_by_user == false) {
-                thread->state = READY;
+            if (!thread->is_blocked_by_user()) {
+                thread->set_state(READY);
                 ready_threads.push_back(thread);
             }
             it = sleeping_threads.erase(it);
@@ -198,7 +225,7 @@ int uthread_init(int quantum_usecs) {
     }
     ::quantum_usecs = quantum_usecs;
     Thread* main_thread = new Thread(0, nullptr);
-    main_thread->state = RUNNING;
+    main_thread->set_state(RUNNING);
     running_thread = main_thread;
     total_quantums = 1;
     all_threads[0] = main_thread;
@@ -231,19 +258,19 @@ int uthread_init(int quantum_usecs) {
 // Wrapper function that calls entry_point and terminates the thread
 void stub_func() {
     unblock_signals();
-    running_thread->entry_point();
+    running_thread->entry_point()();
     uthread_terminate(uthread_get_tid());
 }
 
 static void init_thread_context(Thread* thread) {
-    address_t sp = (address_t) thread->stack + STACK_SIZE - sizeof(address_t);
+    address_t sp = (address_t) thread->stack_top() - sizeof(address_t);
     // Point to stub_func instead of entry_point directly
     address_t pc = (address_t) stub_func;
 
-    sigsetjmp(thread->env, 0);
-    thread->env->__jmpbuf[JB_SP] = translate_address(sp);
-    thread->env->__jmpbuf[JB_PC] = translate_address(pc);
-    sigemptyset(&thread->env->__saved_mask);
+    sigsetjmp(thread->env(), 0);
+    thread->env()->__jmpbuf[JB_SP] = translate_address(sp);
+    thread->env()->__jmpbuf[JB_PC] = translate_address(pc);
+    sigemptyset(&thread->env()->__saved_mask);
 }
 
 int uthread_spawn(thread_entry_point entry_point) {
@@ -297,7 +324,7 @@ int uthread_terminate(int tid){
 
     Thread* thread_to_terminate = it->second;
     bool self_terminate = (thread_to_terminate == running_thread);
-    if (!self_terminate && thread_to_terminate->state == READY) {
+    if (!self_terminate && thread_to_terminate->state() == READY) {
         auto ready_it = std::find(ready_threads.begin(), ready_threads.end(), thread_to_terminate);
         if (ready_it != ready_threads.end()) {
             ready_threads.erase(ready_it);
@@ -317,12 +344,12 @@ int uthread_terminate(int tid){
 
         reset_timer();
 
-        next_thread->state = RUNNING;
-        next_thread->quantums++;
+        next_thread->set_state(RUNNING);
+        next_thread->start_quantum();
         total_quantums++;
         running_thread = next_thread;
         pending_delete = thread_to_terminate;
-        siglongjmp(next_thread->env, 1);
+        siglongjmp(next_thread->env(), 1);
         unblock_signals();
         return 0;
     }
@@ -365,18 +392,18 @@ int uthread_block(int tid) {
         return -1;
     }
     Thread *thread_to_block = all_threads[tid];
-    if (thread_to_block->state == BLOCKED) {
-        thread_to_block->is_blocked_by_user=true;
+    if (thread_to_block->state() == BLOCKED) {
+        thread_to_block->set_blocked_by_user(true);
         return 0;
     }
-    if (running_thread->tid == tid) {
-        thread_to_block->state = BLOCKED;
+    if (running_thread->tid() == tid) {
+        thread_to_block->set_state(BLOCKED);
         
         switch_to_next_thread(BLOCKED);
         
-    } else if (thread_to_block->state == READY) {
-        thread_to_block->state = BLOCKED;
-        thread_to_block->is_blocked_by_user= true;
+    } else if (thread_to_block->state() == READY) {
+        thread_to_block->set_state(BLOCKED);
+        thread_to_block->set_blocked_by_user(true);
         ready_threads.erase(std::remove(ready_threads.begin(), ready_threads.end(), thread_to_block), ready_threads.end());
         
     }
@@ -399,14 +426,14 @@ int uthread_resume(int tid) {
         return -1;
     }
     Thread *thread_to_resume = all_threads[tid];
-    if (thread_to_resume->state == BLOCKED) {
+    if (thread_to_resume->state() == BLOCKED) {
         
-        thread_to_resume->is_blocked_by_user = false;
+        thread_to_resume->set_blocked_by_user(false);
 
         if (sleeping_threads.find(tid) != sleeping_threads.end()) {
             return 0;
         }
-        thread_to_resume->state = READY;
+        thread_to_resume->set_state(READY);
         ready_threads.push_back(thread_to_resume);
      
     }
@@ -429,19 +456,13 @@ int uthread_resume(int tid) {
  *
  * @return On success, return 0. On failure, return -1.
 */
-// static int save_current_thread_context() {
-//     int ret = running_thread->save_context();
-//     std::cerr << "save_context tid=" << running_thread->tid << " ret=" << ret << "\n";
-//     return ret;
-// }
 
 
 
 int uthread_sleep(int num_quantums) {
     block_signals();
-    // int ret_val = sigsetjmp(running_thread->env, 1);
 
-    if (running_thread->tid == 0 && num_quantums != 0) {
+    if (running_thread->tid() == 0 && num_quantums != 0) {
         std::cerr << "thread library error: main thread cannot sleep for more than 0 quantums" << std::endl;
         unblock_signals();
         return -1;
@@ -451,8 +472,8 @@ int uthread_sleep(int num_quantums) {
         unblock_signals();
         return 0;
     }
-    running_thread->quantums_until_wake_up = num_quantums;
-    sleeping_threads[running_thread->tid] = running_thread;
+    running_thread->sleep_for(num_quantums);
+    sleeping_threads[running_thread->tid()] = running_thread;
     switch_to_next_thread(BLOCKED);
 
     unblock_signals();
@@ -466,7 +487,7 @@ int uthread_sleep(int num_quantums) {
  * @return The ID of the calling thread.
 */
 int uthread_get_tid() {
-    return running_thread->tid;
+    return running_thread->tid();
 }
 
 
@@ -497,7 +518,7 @@ int uthread_get_quantums(int tid) {
        std::cerr << "thread library error: thread with ID " << tid << " does not exist" << std::endl;
        return -1;
    }
-   return all_threads[tid]->quantums;
+   return all_threads[tid]->quantums();
 }
 
 
