@@ -51,3 +51,12 @@ python3 test/run_tests.py
 
 [`demos/`](demos/) has small standalone programs for the building blocks: `setitimer`,
 `sigsetjmp`/`siglongjmp` and a `SIGINT` handler.
+
+
+## Demo (1.5 min)
+
+
+https://github.com/user-attachments/assets/8efcf2bc-6b7b-45b1-87a5-9cdaa5af3ba5
+
+
+
